@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import secrets
 from pathlib import Path
 
 from .application.booking_service import BookingService
@@ -25,12 +26,24 @@ def default_data_dir() -> Path:
     return Path.home() / ".local" / "state" / "service_09252_008"
 
 
+def load_or_create_cursor_secret(data_dir: Path) -> bytes:
+    """游标签名密钥：与 SQLite 数据同目录持久化，重启后旧游标仍可校验。"""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    key_path = data_dir / "cursor.key"
+    if key_path.exists():
+        return key_path.read_bytes()
+    secret = secrets.token_bytes(32)
+    key_path.write_bytes(secret)
+    key_path.chmod(0o600)
+    return secret
+
+
 def build_services(data_dir: Path) -> tuple[CatalogService, BookingService, SQLiteStore]:
     store = SQLiteStore(data_dir / "booking.db")
     clock = SystemClock()
     ids = UuidIdGenerator()
     catalog = CatalogService(store, clock, ids)
-    bookings = BookingService(store, clock, ids)
+    bookings = BookingService(store, clock, ids, cursor_secret=load_or_create_cursor_secret(data_dir))
     return catalog, bookings, store
 
 

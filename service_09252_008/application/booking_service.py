@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import timedelta
 from typing import Any, Callable
 
@@ -45,6 +46,7 @@ from ..domain.models import (
     Shipment,
     ShipmentStatus,
     WorkshopResource,
+    dt_from_str,
     dt_to_str,
 )
 from ..domain.rules import (
@@ -64,6 +66,7 @@ from .catalog_service import (
     COLLECTION_RESOURCES,
     COLLECTION_WINDOWS,
 )
+from .cursor import BookingCursor, decode_cursor, encode_cursor
 from .ports import Clock, IdGenerator
 
 COLLECTION_BOOKINGS = "bookings"
@@ -78,6 +81,9 @@ DEFAULT_LOCK_TTL_SECONDS = 1800
 DEFAULT_QUOTE_TTL_SECONDS = 86400
 MIN_LOCK_TTL_SECONDS = 60
 MAX_LOCK_TTL_SECONDS = 86400
+
+DEFAULT_PAGE_LIMIT = 50
+MAX_PAGE_LIMIT = 200
 
 
 def _canonical(payload: dict[str, Any]) -> str:
@@ -95,16 +101,30 @@ class BookingService:
         *,
         lock_ttl_seconds: int = DEFAULT_LOCK_TTL_SECONDS,
         quote_ttl_seconds: int = DEFAULT_QUOTE_TTL_SECONDS,
+        cursor_secret: bytes | str | None = None,
     ) -> None:
         self._store = store
         self._clock = clock
         self._ids = ids
         self._lock_ttl = lock_ttl_seconds
         self._quote_ttl = quote_ttl_seconds
+        self._cursor_secret = self._resolve_cursor_secret(cursor_secret)
 
     # ------------------------------------------------------------------
     # 基础设施
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_cursor_secret(secret: bytes | str | None) -> bytes:
+        if secret is None:
+            # 未显式注入时使用进程内随机密钥：进程重启后旧游标失效，
+            # 客户端会收到 invalid_cursor 并从首页重新开始。
+            return os.urandom(32)
+        if isinstance(secret, str):
+            secret = secret.encode("utf-8")
+        if len(secret) < 16:
+            raise ValueError("cursor_secret must be at least 16 bytes")
+        return secret
 
     def _emit(self, event_type: str, booking_id: str | None, payload: dict[str, Any]) -> None:
         event = DomainEvent(
@@ -1002,6 +1022,65 @@ class BookingService:
 
     def list_bookings(self, **filters: Any) -> list[dict[str, Any]]:
         return [self._booking_view(Booking.from_dict(b)) for b in self._store.query(COLLECTION_BOOKINGS, **filters)]
+
+    def list_bookings_page(
+        self,
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+        status: str | None = None,
+        window_id: str | None = None,
+    ) -> dict[str, Any]:
+        """预约游标分页。
+
+        整页读取在调用方存储的单个事务/快照内完成（多取一条判断是否有
+        下一页），因此翻页期间的新插入只会出现在后续页之后，既不会与
+        当前页重叠，也不会让前序条目回跳。``cursor`` 损坏或签名不匹配时
+        抛出 :class:`~service_09252_008.domain.errors.CursorError`。
+        """
+        if limit is None:
+            limit = DEFAULT_PAGE_LIMIT
+        if isinstance(limit, bool) or not isinstance(limit, int) or not (1 <= limit <= MAX_PAGE_LIMIT):
+            raise ValidationError(
+                "limit must be an integer between 1 and 200",
+                details={"max": MAX_PAGE_LIMIT},
+            )
+        filters: dict[str, Any] = {}
+        if status is not None:
+            try:
+                filters["status"] = BookingStatus(status).value
+            except ValueError as exc:
+                raise ValidationError(f"unknown booking status: {status}", details={"status": status}) from exc
+        if window_id is not None:
+            if not isinstance(window_id, str) or not window_id.strip():
+                raise ValidationError("window_id must be a non-empty string")
+            filters["window_id"] = window_id.strip()
+
+        anchor = decode_cursor(cursor, self._cursor_secret)
+        anchor_key = anchor.to_anchor() if anchor is not None else None
+        with self._store.transaction():
+            rows = self._store.scan(
+                COLLECTION_BOOKINGS,
+                limit=limit + 1,
+                cursor=anchor_key,
+                filters=filters,
+            )
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            items = [self._booking_view(Booking.from_dict(row)) for row in rows]
+            next_cursor: str | None = None
+            if has_more:
+                last = rows[-1]
+                next_cursor = encode_cursor(
+                    BookingCursor(dt_from_str(last["created_at"]), last["booking_id"]),
+                    self._cursor_secret,
+                )
+        return {
+            "items": items,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "limit": limit,
+        }
 
     def _booking_view(self, booking: Booking) -> dict[str, Any]:
         view = booking.to_dict()

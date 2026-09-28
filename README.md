@@ -13,6 +13,7 @@ service_09252_008/
 ├── application/       # 应用服务层
 │   ├── ports.py       #   可替换端口：Clock / IdGenerator（测试注入手动时钟与序列 ID）
 │   ├── catalog_service.py  # 目录登记与校验
+│   ├── cursor.py      #   分页游标编解码：排序锚点 + HMAC 签名（损坏返回 invalid_cursor）
 │   └── booking_service.py  # 预约状态机：申请/报价/锁定/改期/发运/到货/签到/结算/取消/恢复
 ├── persistence/       # 持久化层
 │   ├── store.py       #   存储端口 + 内存实现（快照回滚）
@@ -52,6 +53,7 @@ python3 -m service_09252_008 --host 127.0.0.1 --port 8080
 | --- | --- | --- |
 | POST | `/packages` `/mentors` `/resources` `/material-batches` `/reception-windows` | 目录登记 |
 | POST | `/bookings` | 申请（需幂等键） |
+| GET  | `/bookings` | 预约游标分页（`limit`、`cursor`、`status`、`window_id`） |
 | POST | `/bookings/{id}/quote` | 报价 |
 | POST | `/bookings/{id}/lock` | 锁定（需幂等键，可带 `ttl_seconds`） |
 | POST | `/bookings/{id}/reschedule` | 改期（发运后拒绝） |
@@ -67,6 +69,18 @@ python3 -m service_09252_008 --host 127.0.0.1 --port 8080
 幂等键经请求头 `Idempotency-Key` 或载荷字段 `idempotency_key` 传入；
 同键重放返回首次结果（`idempotent_replay: true`），同键不同载荷返回 409。
 
+### 预约游标分页
+
+`GET /bookings` 返回 `{items, next_cursor, has_more, limit}`：
+
+- 排序锚点为 `(created_at, booking_id)` 升序键集（keyset）分页，游标由
+  服务端用 HMAC 签名（`v1.<payload>.<signature>`），客户端应视为不透明令牌；
+- 每一页在存储的单个事务/快照内读取，翻页期间新插入的预约只会出现在后续
+  页之后，前后页不重叠、已交付行不回跳；
+- 游标损坏、过期版本或签名不匹配时返回 `400 {"error": "invalid_cursor"}`，
+  客户端应丢弃游标并从首页重新开始；
+- `limit` 取值 1–200（默认 50），`status`/`window_id` 为等值过滤。
+
 ## 测试
 
 ```bash
@@ -75,7 +89,8 @@ python3 -m unittest discover -s tests -v
 
 覆盖：主流程端到端、前置培训/容量/安全/互斥/运输周期规则、跨时区、
 幂等重放、并发锁定（内存与 SQLite 双后端）、重启后超时恢复、
-部分到货与在途损耗、取消释放候补与损耗记录、HTTP 接口边界。
+部分到货与在途损耗、取消释放候补与损耗记录、HTTP 接口边界、
+预约游标分页（跨页不重叠、插入期间翻页、游标损坏与 HTTP 400 映射）。
 
 ## 编译检查
 

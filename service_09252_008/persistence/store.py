@@ -35,6 +35,24 @@ class Store(Protocol):
         """按顶层字段等值过滤；无过滤条件时返回整个集合。"""
         ...
 
+    def scan(
+        self,
+        collection: str,
+        *,
+        limit: int,
+        cursor: tuple[str, str] | None = None,
+        filters: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """键集分页扫描。
+
+        排序锚点为文档的 ``created_at`` 字段与文档主键（升序、全序）；
+        ``cursor`` 为 ``(created_at ISO 字符串, key)`` 或 ``None``（首页），
+        只返回严格位于锚点之后、至多 ``limit`` 条文档；``filters`` 为顶层
+        字段等值过滤。实现不得自行开关事务：扫描必须并入调用方事务，
+        在同一快照/写锁内完成，以保证翻页过程中并发写入不会造成跨页重叠。
+        """
+        ...
+
     def close(self) -> None:
         ...
 
@@ -92,6 +110,28 @@ class InMemoryStore:
             records = list(self._data.get(collection, {}).values())
         result = [r for r in records if all(r.get(field) == value for field, value in filters.items())]
         return deepcopy(result)
+
+    def scan(
+        self,
+        collection: str,
+        *,
+        limit: int,
+        cursor: tuple[str, str] | None = None,
+        filters: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        filters = filters or {}
+        with self._lock:
+            entries = list(self._data.get(collection, {}).items())
+        matching = [
+            (key, record)
+            for key, record in entries
+            if all(record.get(field) == value for field, value in filters.items())
+        ]
+        matching.sort(key=lambda item: (item[1]["created_at"], item[0]))
+        if cursor is not None:
+            anchor_ts, anchor_key = cursor
+            matching = [item for item in matching if (item[1]["created_at"], item[0]) > (anchor_ts, anchor_key)]
+        return deepcopy([record for _, record in matching[:limit]])
 
     def close(self) -> None:  # pragma: no cover - 对称接口
         pass

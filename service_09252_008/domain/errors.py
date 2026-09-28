@@ -57,6 +57,12 @@ class IdempotencyConflict(DomainError):
     code = "idempotency_conflict"
 
 
+class CursorError(ValidationError):
+    """分页游标缺失、损坏或签名不匹配（客户端应丢弃后重新从首页开始）。"""
+
+    code = "invalid_cursor"
+
+
 class BookingImmutableError(StateError):
     """预约已不可变更（材料已发运或流程已终结）。"""
 

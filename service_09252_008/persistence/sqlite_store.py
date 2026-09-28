@@ -90,6 +90,40 @@ class SQLiteStore:
         records = [json.loads(row["data"]) for row in rows]
         return [r for r in records if all(r.get(field) == value for field, value in filters.items())]
 
+    def scan(
+        self,
+        collection: str,
+        *,
+        limit: int,
+        cursor: tuple[str, str] | None = None,
+        filters: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        # 单条键集分页语句：不自行开关事务，复用调用方事务（BEGIN IMMEDIATE
+        # 已持有的同一连接快照），因此翻页窗口内的并发写入只会出现在后续页、
+        # 不会造成跨页重叠或回跳。排序锚点与文档结构一致：
+        # created_at 为规范 UTC ISO 字符串，字节序即时间序，key 为决胜列。
+        clauses = ["collection = ?"]
+        params: list[Any] = [collection]
+        for field, value in (filters or {}).items():
+            clauses.append(f"json_extract(data, '$.{field}') = ?")
+            params.append(value)
+        if cursor is not None:
+            anchor_ts, anchor_key = cursor
+            clauses.append(
+                "(json_extract(data, '$.created_at') > ? "
+                "OR (json_extract(data, '$.created_at') = ? AND key > ?))"
+            )
+            params.extend([anchor_ts, anchor_ts, anchor_key])
+        sql = (
+            "SELECT data FROM records WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY json_extract(data, '$.created_at'), key LIMIT ?"
+        )
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [json.loads(row["data"]) for row in rows]
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()

@@ -9,6 +9,7 @@ import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
+from urllib.parse import parse_qs
 
 from ..application.booking_service import BookingService
 from ..application.catalog_service import (
@@ -22,6 +23,7 @@ from ..application.catalog_service import (
 from ..domain.errors import (
     BusinessRuleError,
     ConflictError,
+    CursorError,
     DomainError,
     IdempotencyConflict,
     NotFoundError,
@@ -32,6 +34,7 @@ from ..domain.errors import (
 _ERROR_STATUS = {
     NotFoundError.code: 404,
     ValidationError.code: 400,
+    CursorError.code: 400,
     BusinessRuleError.code: 422,
     StateError.code: 409,
     ConflictError.code: 409,
@@ -39,6 +42,23 @@ _ERROR_STATUS = {
 }
 
 HandlerFn = Callable[[dict[str, Any], dict[str, str]], Any]
+
+
+def _query_int(query: dict[str, list[str]], name: str) -> int | None:
+    raw = query.get(name)
+    if not raw:
+        return None
+    try:
+        return int(raw[-1])
+    except ValueError as exc:
+        raise ValidationError(f"query parameter {name} must be an integer", details={"parameter": name}) from exc
+
+
+def _query_str(query: dict[str, list[str]], name: str) -> str | None:
+    raw = query.get(name)
+    if not raw:
+        return None
+    return raw[-1]
 
 
 class _Router:
@@ -89,6 +109,16 @@ def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
 
     # 预约流程
     router.add("POST", "/bookings", lambda body, hdr: bookings.apply(with_idempotency_key(body, hdr)))
+    router.add(
+        "GET",
+        "/bookings",
+        lambda body, hdr: bookings.list_bookings_page(
+            limit=_query_int(hdr["__query__"], "limit"),
+            cursor=_query_str(hdr["__query__"], "cursor"),
+            status=_query_str(hdr["__query__"], "status"),
+            window_id=_query_str(hdr["__query__"], "window_id"),
+        ),
+    )
     router.add("GET", "/bookings/{booking_id}", lambda body, hdr: bookings.get_booking(hdr["__path__"]["booking_id"]))
     router.add(
         "POST",
@@ -159,7 +189,8 @@ def make_handler_class(router: _Router) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(body)
 
         def _dispatch(self, method: str) -> None:
-            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            raw_path, _, raw_query = self.path.partition("?")
+            path = raw_path.rstrip("/") or "/"
             matched = router.match(method, path)
             if matched is None:
                 self._send_json(404, {"error": "not_found", "message": f"no route for {method} {path}"})
@@ -176,6 +207,7 @@ def make_handler_class(router: _Router) -> type[BaseHTTPRequestHandler]:
                     body = parsed
                 headers = {k.lower(): v for k, v in self.headers.items()}
                 headers["__path__"] = path_params  # type: ignore[assignment]
+                headers["__query__"] = parse_qs(raw_query, keep_blank_values=True)  # type: ignore[assignment]
                 result = handler(body, headers)
                 status = 201 if method == "POST" and path == "/bookings" else 200
                 self._send_json(status, result)
