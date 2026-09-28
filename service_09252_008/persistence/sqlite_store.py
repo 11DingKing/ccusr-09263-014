@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -17,6 +18,10 @@ CREATE TABLE IF NOT EXISTS records (
     PRIMARY KEY (collection, key)
 );
 """
+
+# 过滤字段名会进入 json_extract 的 JSON 路径；只允许普通标识符，
+# 防止任何调用方把引号/ SQL 片段带进语句（参数值始终走绑定）。
+_FIELD_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class SQLiteStore:
@@ -89,6 +94,40 @@ class SQLiteStore:
             rows = self._conn.execute("SELECT data FROM records WHERE collection = ?", (collection,)).fetchall()
         records = [json.loads(row["data"]) for row in rows]
         return [r for r in records if all(r.get(field) == value for field, value in filters.items())]
+
+    def scan_page(
+        self,
+        collection: str,
+        *,
+        limit: int,
+        filters: dict[str, Any] | None = None,
+        anchor_created_at: str | None = None,
+        anchor_key: str | None = None,
+    ) -> list[dict[str, Any]]:
+        # 整条键集扫描是“单条 SELECT”：过滤、(created_at, key) 严格大于锚点、
+        # 排序与 LIMIT 都由 SQLite 在同一条语句的同一快照内完成。语句开始后
+        # 提交的新插入对本语句不可见，因此相邻两页不会重叠或遗漏。
+        filters = filters or {}
+        clauses = ["collection = ?"]
+        params: list[Any] = [collection]
+        for field, value in filters.items():
+            if not _FIELD_NAME_RE.match(field):
+                raise ValueError(f"unsupported filter field: {field!r}")
+            clauses.append(f"json_extract(data, '$.{field}') = ?")
+            params.append(value)
+        if anchor_created_at is not None and anchor_key is not None:
+            # 行值比较与 ORDER BY 完全一致：严格晚于上一页最后一条
+            clauses.append("(json_extract(data, '$.created_at'), key) > (?, ?)")
+            params.extend([anchor_created_at, anchor_key])
+        sql = (
+            "SELECT data FROM records WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY json_extract(data, '$.created_at'), key LIMIT ?"
+        )
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [json.loads(row["data"]) for row in rows]
 
     def close(self) -> None:
         with self._lock:

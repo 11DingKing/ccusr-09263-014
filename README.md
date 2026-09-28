@@ -13,6 +13,7 @@ service_09252_008/
 ├── application/       # 应用服务层
 │   ├── ports.py       #   可替换端口：Clock / IdGenerator（测试注入手动时钟与序列 ID）
 │   ├── catalog_service.py  # 目录登记与校验
+│   ├── cursor.py           # 预约分页游标：锚点编码、HMAC 签名与损坏识别
 │   └── booking_service.py  # 预约状态机：申请/报价/锁定/改期/发运/到货/签到/结算/取消/恢复
 ├── persistence/       # 持久化层
 │   ├── store.py       #   存储端口 + 内存实现（快照回滚）
@@ -62,7 +63,14 @@ python3 -m service_09252_008 --host 127.0.0.1 --port 8080
 | POST | `/bookings/{id}/settle` | 结算（`actual_attendance`、可选 `damaged`） |
 | POST | `/bookings/{id}/cancel` | 取消（释放候补、按规则记损耗） |
 | POST | `/admin/recover` | 恢复超时任务 |
+| GET  | `/bookings?cursor=&limit=&status=` | 预约游标分页（`next_cursor` 续翻） |
 | GET  | `/bookings/{id}` `/health` | 查询 |
+
+游标分页：锚点为 `(created_at, booking_id)`，游标由 Python 编码并带
+HMAC 签名（含过滤条件指纹），存储层用单条键集 SELECT 在同一语句快照内
+完成过滤/排序/限量，翻页期间的新插入不会造成前后页重叠；游标损坏、伪造
+或与查询参数不一致时返回 `400 {"error": "invalid_cursor"}`，客户端应丢弃
+游标从首页重新开始。
 
 幂等键经请求头 `Idempotency-Key` 或载荷字段 `idempotency_key` 传入；
 同键重放返回首次结果（`idempotent_replay: true`），同键不同载荷返回 409。

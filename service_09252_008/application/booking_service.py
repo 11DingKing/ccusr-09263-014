@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 from datetime import timedelta
 from typing import Any, Callable
 
@@ -64,6 +65,7 @@ from .catalog_service import (
     COLLECTION_RESOURCES,
     COLLECTION_WINDOWS,
 )
+from .cursor import CursorAnchor, decode_cursor, encode_cursor
 from .ports import Clock, IdGenerator
 
 COLLECTION_BOOKINGS = "bookings"
@@ -78,6 +80,9 @@ DEFAULT_LOCK_TTL_SECONDS = 1800
 DEFAULT_QUOTE_TTL_SECONDS = 86400
 MIN_LOCK_TTL_SECONDS = 60
 MAX_LOCK_TTL_SECONDS = 86400
+
+DEFAULT_PAGE_SIZE = 20
+MAX_PAGE_SIZE = 100
 
 
 def _canonical(payload: dict[str, Any]) -> str:
@@ -95,12 +100,16 @@ class BookingService:
         *,
         lock_ttl_seconds: int = DEFAULT_LOCK_TTL_SECONDS,
         quote_ttl_seconds: int = DEFAULT_QUOTE_TTL_SECONDS,
+        cursor_secret: bytes | None = None,
     ) -> None:
         self._store = store
         self._clock = clock
         self._ids = ids
         self._lock_ttl = lock_ttl_seconds
         self._quote_ttl = quote_ttl_seconds
+        # 游标签名密钥：缺省随机生成（游标为短命令牌，服务重启后旧游标失效，
+        # 客户端会收到 invalid_cursor 并从头翻页）。
+        self._cursor_secret = cursor_secret or secrets.token_bytes(32)
 
     # ------------------------------------------------------------------
     # 基础设施
@@ -1002,6 +1011,69 @@ class BookingService:
 
     def list_bookings(self, **filters: Any) -> list[dict[str, Any]]:
         return [self._booking_view(Booking.from_dict(b)) for b in self._store.query(COLLECTION_BOOKINGS, **filters)]
+
+    def list_bookings_page(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        """预约游标分页。
+
+        排序锚点为 ``(created_at, booking_id)``，与存储层 ``scan_page`` 的
+        ``ORDER BY`` 一致；游标内绑定过滤条件指纹并带 HMAC 签名。
+        存储层的单条键集 SELECT 在同一语句快照内完成过滤/排序/限量，
+        因此翻页期间新插入的预约不会造成前后页重叠或遗漏。
+        游标损坏或与当前过滤条件不一致时抛 :class:`InvalidCursorError`。
+        """
+        page_size = self._page_size(limit)
+        filters: dict[str, Any] = {}
+        if status is not None:
+            if not isinstance(status, str):
+                raise ValidationError("field status must be a string")
+            try:
+                BookingStatus(status)
+            except ValueError:
+                raise ValidationError(f"unknown booking status: {status}", details={"status": status})
+            filters["status"] = status
+        scope = _canonical({"collection": COLLECTION_BOOKINGS, "filters": filters})
+        anchor = decode_cursor(cursor, scope=scope, secret=self._cursor_secret) if cursor else None
+
+        # 注意：不把读取包进 BEGIN IMMEDIATE 事务——单条键集 SELECT 自身就是
+        # 一个一致快照，且读接口不应占用写锁。
+        rows = self._store.scan_page(
+            COLLECTION_BOOKINGS,
+            limit=page_size + 1,
+            filters=filters,
+            anchor_created_at=anchor.created_at if anchor is not None else None,
+            anchor_key=anchor.booking_id if anchor is not None else None,
+        )
+        has_more = len(rows) > page_size
+        page_rows = rows[:page_size]
+        items = [self._booking_view(Booking.from_dict(row)) for row in page_rows]
+        next_cursor: str | None = None
+        if has_more and page_rows:
+            last = Booking.from_dict(page_rows[-1])
+            next_cursor = encode_cursor(
+                CursorAnchor(dt_to_str(last.created_at), last.booking_id),
+                scope,
+                self._cursor_secret,
+            )
+        return {"items": items, "next_cursor": next_cursor, "has_more": has_more}
+
+    @staticmethod
+    def _page_size(limit: int | None) -> int:
+        if limit is None:
+            return DEFAULT_PAGE_SIZE
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise ValidationError("field limit must be an integer")
+        if not (1 <= limit <= MAX_PAGE_SIZE):
+            raise ValidationError(
+                f"limit must be between 1 and {MAX_PAGE_SIZE}",
+                details={"min": 1, "max": MAX_PAGE_SIZE},
+            )
+        return limit
 
     def _booking_view(self, booking: Booking) -> dict[str, Any]:
         view = booking.to_dict()

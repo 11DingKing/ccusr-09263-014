@@ -35,6 +35,28 @@ class Store(Protocol):
         """按顶层字段等值过滤；无过滤条件时返回整个集合。"""
         ...
 
+    def scan_page(
+        self,
+        collection: str,
+        *,
+        limit: int,
+        filters: dict[str, Any] | None = None,
+        anchor_created_at: str | None = None,
+        anchor_key: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """键集分页：按 ``(created_at, key)`` 升序取下一页。
+
+        - ``limit`` 为期望取回的条数（含锚点之后的严格“下一条”起算），
+          调用方一般传 ``page_size + 1`` 以判断是否还有下一页；
+        - ``filters`` 为顶层字段等值过滤，必须与游标签发时的过滤条件一致；
+        - 锚点为 ``None`` 时取首页；否则只返回严格晚于
+          ``(anchor_created_at, anchor_key)`` 的记录。
+
+        实现必须在同一读取快照内完成过滤、排序与限量，
+        保证并发写入不会让相邻两页出现重叠或遗漏。
+        """
+        ...
+
     def close(self) -> None:
         ...
 
@@ -92,6 +114,36 @@ class InMemoryStore:
             records = list(self._data.get(collection, {}).values())
         result = [r for r in records if all(r.get(field) == value for field, value in filters.items())]
         return deepcopy(result)
+
+    def scan_page(
+        self,
+        collection: str,
+        *,
+        limit: int,
+        filters: dict[str, Any] | None = None,
+        anchor_created_at: str | None = None,
+        anchor_key: str | None = None,
+    ) -> list[dict[str, Any]]:
+        filters = filters or {}
+        with self._lock:
+            # 持锁期间一次性取一致快照：过滤、键集比较、排序与限量都在这份
+            # 深拷贝上完成，事务内的并发写入不会混入本次扫描（与 SQLite 的
+            # 单条 SELECT 语句快照语义对齐）。
+            entries = [
+                (key, deepcopy(record))
+                for key, record in self._data.get(collection, {}).items()
+            ]
+        rows: list[tuple[str, str, dict[str, Any]]] = []
+        for key, record in entries:
+            if not all(record.get(field) == value for field, value in filters.items()):
+                continue
+            created_at = str(record.get("created_at"))
+            if anchor_created_at is not None and anchor_key is not None:
+                if (created_at, key) <= (anchor_created_at, anchor_key):
+                    continue
+            rows.append((created_at, key, record))
+        rows.sort(key=lambda item: (item[0], item[1]))
+        return [deepcopy(record) for _, _, record in rows[:limit]]
 
     def close(self) -> None:  # pragma: no cover - 对称接口
         pass
